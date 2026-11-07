@@ -2,53 +2,101 @@ import streamlit as st
 import requests
 import pandas as pd
 
-# Define European leagues with their API search names
+# ESPN league IDs for the supported leagues.
 leagues = {
-    "English Premier League": "English_Premier_League",
-    "Spanish La Liga": "Spanish La Liga",
-    "German Bundesliga": "German Bundesliga",
-    "Italian Serie A": "Italian Serie A",
-    "French Ligue 1": "French Ligue 1"
+    "English Premier League": "eng.1",
+    "Spanish La Liga": "esp.1",
+    "German Bundesliga": "ger.1",
+    "Italian Serie A": "ita.1",
+    "French Ligue 1": "fra.1",
 }
 
-@st.cache_data
-def get_players(league_name):
-    """Fetch all players from the selected league."""
+ESPN_API_BASE = "https://site.api.espn.com/apis/site/v2/sports/soccer"
+
+
+@st.cache_data(ttl=3600)
+def get_players(league_id):
+    """Fetch and normalize the selected league's ESPN team rosters."""
     try:
-        # Get teams in the league
-        teams_url = f"https://www.thesportsdb.com/api/v1/json/123/search_all_teams.php?l={league_name}"
-        teams_response = requests.get(teams_url)
-        teams_data = teams_response.json()
-        
-        if 'teams' not in teams_data or not teams_data['teams']:
-            st.error(f"No teams found for {league_name}")
-            return pd.DataFrame()
-        
-        teams = teams_data['teams']
-        all_players = []
-        
-        # For each team, get players
-        for team in teams:
-            team_id = team['idTeam']
-            team_name = team['strTeam']
-            players_url = f"https://www.thesportsdb.com/api/v1/json/123/lookup_all_players.php?id={team_id}"
-            players_response = requests.get(players_url)
-            players_data = players_response.json()
-            
-            if 'player' in players_data and players_data['player']:
-                for player in players_data['player']:
-                    player['team'] = team_name
-                    all_players.append(player)
-        
-        if not all_players:
-            st.warning(f"No players found for {league_name}")
-            return pd.DataFrame()
-        
-        df = pd.DataFrame(all_players)
-        return df
-    except Exception as e:
-        st.error(f"Error fetching data: {str(e)}")
+        teams_url = f"{ESPN_API_BASE}/{league_id}/teams"
+        teams_data = _get_api_json(teams_url, params={"limit": 100})
+        leagues_data = teams_data.get("sports", [{}])[0].get("leagues", [])
+        teams = leagues_data[0].get("teams", []) if leagues_data else []
+        if not teams:
+            raise ValueError(f"ESPN returned no teams for league {league_id}.")
+
+        players = []
+        for entry in teams:
+            team = entry.get("team", {})
+            team_id = team.get("id")
+            team_name = team.get("displayName") or team.get("name")
+            if not team_id or not team_name:
+                continue
+
+            roster_url = f"{ESPN_API_BASE}/{league_id}/teams/{team_id}/roster"
+            roster_data = _get_api_json(roster_url)
+            for athlete in roster_data.get("athletes", []):
+                position = athlete.get("position") or {}
+                birth_place = athlete.get("birthPlace") or {}
+                players.append(
+                    {
+                        "strPlayer": athlete.get("displayName") or athlete.get("fullName", ""),
+                        "strPosition": position.get("displayName") or position.get("name", ""),
+                        "strNationality": athlete.get("citizenship")
+                        or athlete.get("citizenshipCountry", ""),
+                        "team": team_name,
+                        "dateBorn": (athlete.get("dateOfBirth") or "")[:10],
+                        "strBirthLocation": ", ".join(
+                            filter(
+                                None,
+                                (
+                                    birth_place.get("city"),
+                                    birth_place.get("state"),
+                                    birth_place.get("country"),
+                                ),
+                            )
+                        ),
+                    }
+                )
+
+        if not players:
+            raise ValueError(f"ESPN returned no player rosters for league {league_id}.")
+        return pd.DataFrame(players)
+    except requests.exceptions.HTTPError as e:
+        st.error(f"Error fetching data: {e}")
         return pd.DataFrame()
+    except requests.exceptions.RequestException as e:
+        st.error(f"Network error fetching player data from ESPN: {e}")
+        return pd.DataFrame()
+    except ValueError as e:
+        st.error(f"Invalid response from ESPN: {e}")
+        return pd.DataFrame()
+
+
+def _get_api_json(url, params=None):
+    response = requests.get(url, params=params, timeout=15)
+
+    if response.status_code == 429:
+        retry_after = response.headers.get("Retry-After")
+        wait_message = (
+            f" Try again in {retry_after} seconds."
+            if retry_after
+            else " Try again later."
+        )
+        raise requests.exceptions.HTTPError(
+            f"ESPN rate limit reached (HTTP 429).{wait_message}",
+            response=response,
+        )
+
+    response.raise_for_status()
+    try:
+        return response.json()
+    except ValueError as e:
+        content_type = response.headers.get("Content-Type", "unknown")
+        raise ValueError(
+            f"ESPN returned a non-JSON response "
+            f"(HTTP {response.status_code}, content type {content_type})."
+        ) from e
 
 # Streamlit app
 st.title("European Soccer Players Dashboard")
@@ -58,10 +106,10 @@ st.markdown("Select a European league to view all players across teams in that l
 selected_league = st.selectbox("Choose a League", list(leagues.keys()))
 
 if selected_league:
-    league_api_name = leagues[selected_league]
+    league_id = leagues[selected_league]
     
     with st.spinner(f"Fetching players from {selected_league}..."):
-        df = get_players(league_api_name)
+        df = get_players(league_id)
     
     if not df.empty:
         st.subheader(f"Players in {selected_league}")
@@ -109,4 +157,4 @@ if selected_league:
         st.info("No data available for the selected league.")
 
 st.markdown("---")
-st.markdown("Data sourced from TheSportsDB API. Note: Free API has rate limits.")
+st.markdown("Player data sourced from ESPN.")
